@@ -1,0 +1,315 @@
+# sleek_search.py
+
+from PyQt5 import QtWidgets, QtCore, QtGui
+import os
+import sys
+import subprocess
+import json
+import time
+import tempfile
+import ctypes
+import ctypes.wintypes
+
+CACHE_FILE = os.path.join(tempfile.gettempdir(), "sleek_search_cache.json")
+QUICK_SECTIONS = ["E:\\", "F:\\"]
+SEARCH_LIMIT = 500
+
+class IndexerThread(QtCore.QThread):
+    indexed = QtCore.pyqtSignal(list)
+
+    def __init__(self, quick_mode=True):
+        super().__init__()
+        self.quick_mode = quick_mode
+        self._is_running = True
+
+    def stop(self):
+        self._is_running = False
+
+    def run(self):
+        results = []
+        roots = (
+            [d for d in QUICK_SECTIONS if os.path.exists(d)]
+            if self.quick_mode else
+            [f"{d}:\\" for d in "ABDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{d}:\\") and d != 'C']
+        )
+
+        for root in roots:
+            for dirpath, _, filenames in os.walk(root):
+                if not self._is_running:
+                    return
+                for f in filenames:
+                    try:
+                        path = os.path.join(dirpath, f)
+                        stats = os.stat(path)
+                        results.append({
+                            "name": f,
+                            "path": path,
+                            "size": stats.st_size,
+                            "mtime": stats.st_mtime,
+                        })
+                    except:
+                        continue
+        self.indexed.emit(results)
+
+class SleekSearchApp(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.setWindowTitle("Sleek Search")
+        self.setWindowIcon(QtGui.QIcon("sleek_search_icon.ico"))
+        self.resize(1000, 400)
+        self.quick_mode = True
+        self.all_files = []
+        self.maximized = False
+
+        self.settings = QtCore.QSettings("SleekSearch", "WindowPrefs")
+        self.restoreGeometry(self.settings.value("geometry", type=QtCore.QByteArray))
+        self.sort_order = QtCore.Qt.AscendingOrder
+        self.dark_mode = True
+
+        self.init_ui()
+        self.set_theme()
+        self.load_cache()
+        QtCore.QTimer.singleShot(0, self.index_files)
+
+    def init_ui(self):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        title_bar = QtWidgets.QWidget()
+        title_bar.setStyleSheet("background-color: #1e2a36; border-top-left-radius: 10px; border-top-right-radius: 10px;")
+        title_bar.setFixedHeight(32)
+        title_layout = QtWidgets.QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+
+        title_label = QtWidgets.QLabel("  Sleek Search")
+        title_label.setStyleSheet("color: white; font-weight: bold; font-size: 14px;")
+
+        btn_min = QtWidgets.QPushButton("—")
+        btn_max = QtWidgets.QPushButton("❐")
+        btn_close = QtWidgets.QPushButton("✕")
+        for btn in (btn_min, btn_max, btn_close):
+            btn.setFixedSize(36, 28)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #1e2a36; color: white; border: none;
+                }
+                QPushButton:hover {
+                    background-color: #3d5a73;
+                }
+            """)
+        btn_min.clicked.connect(self.showMinimized)
+        btn_close.clicked.connect(self.close)
+        btn_max.clicked.connect(self.toggle_max_restore)
+
+        title_layout.addWidget(title_label)
+        title_layout.addStretch()
+        title_layout.addWidget(btn_min)
+        title_layout.addWidget(btn_max)
+        title_layout.addWidget(btn_close)
+        layout.addWidget(title_bar)
+
+        # Sort and theme buttons
+        self.sort_button = QtWidgets.QPushButton("Sort by Date ⬇")
+        self.sort_button.clicked.connect(self.toggle_sort)
+        theme_button = QtWidgets.QPushButton("Toggle Theme")
+        theme_button.clicked.connect(self.toggle_theme)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addWidget(self.sort_button)
+        btn_row.addWidget(theme_button)
+        layout.addLayout(btn_row)
+
+        self.toggle_btn = QtWidgets.QPushButton("Switch to Deep Scan (All Drives except C:)")
+        self.toggle_btn.clicked.connect(self.toggle_mode)
+        layout.addWidget(self.toggle_btn)
+
+        self.status = QtWidgets.QLabel("📁 Initializing...")
+        layout.addWidget(self.status)
+
+        self.input = QtWidgets.QLineEdit()
+        self.input.setPlaceholderText("Type to search by file name...")
+        self.input.textChanged.connect(self.search_files)
+        layout.addWidget(self.input)
+
+        self.results = QtWidgets.QTableWidget()
+        self.results.setColumnCount(4)
+        self.results.setHorizontalHeaderLabels(["Name", "Size (MB)", "Modified", "Full Path"])
+        self.results.horizontalHeader().setStretchLastSection(True)
+        self.results.setEditTriggers(QtWidgets.QTableWidget.NoEditTriggers)
+        self.results.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.results.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.results.customContextMenuRequested.connect(self.show_context_menu)
+        self.results.doubleClicked.connect(self.open_file)
+        layout.addWidget(self.results)
+
+        widget.setLayout(layout)
+        self.setCentralWidget(widget)
+
+    def set_theme(self):
+        if self.dark_mode:
+            self.setStyleSheet("""
+                QWidget { background-color: #2a3b4c; color: #e0e0e0; font-family: 'Segoe UI'; font-size: 14px; border-radius: 10px; }
+                QPushButton { background-color: #3d5a73; padding: 6px; border-radius: 6px; }
+                QLineEdit { background-color: #3a4c5c; color: white; border-radius: 6px; padding: 6px; }
+                QTableWidget { background-color: #3a4c5c; color: #e0e0e0; border-radius: 6px; }
+                QHeaderView::section { background-color: #1e2a36; color: white; }
+                QScrollBar:vertical { background: transparent; width: 10px; }
+                QScrollBar::handle:vertical { background: #5c7d99; border-radius: 5px; }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; background: none; border: none; }
+            """)
+        else:
+            self.setStyleSheet("""
+                QWidget { background-color: #f5f5f5; color: #333; font-family: 'Segoe UI'; font-size: 14px; border-radius: 10px; }
+                QPushButton { background-color: #cfd8dc; padding: 6px; border-radius: 6px; }
+                QLineEdit { background-color: #e0e0e0; color: #111; border-radius: 6px; padding: 6px; }
+                QTableWidget { background-color: #ffffff; color: #222; border-radius: 6px; }
+                QHeaderView::section { background-color: #cccccc; color: black; }
+                QScrollBar:vertical { background: transparent; width: 10px; }
+                QScrollBar::handle:vertical { background: #888; border-radius: 5px; }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; background: none; border: none; }
+            """)
+
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.set_theme()
+
+    def toggle_sort(self):
+        self.sort_order = QtCore.Qt.DescendingOrder if self.sort_order == QtCore.Qt.AscendingOrder else QtCore.Qt.AscendingOrder
+        self.results.sortItems(2, self.sort_order)
+        arrow = "⬇" if self.sort_order == QtCore.Qt.AscendingOrder else "⬆"
+        self.sort_button.setText(f"Sort by Date {arrow}")
+
+    def toggle_max_restore(self):
+        if self.maximized:
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self.maximized = not self.maximized
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform != "win32":
+            return super().nativeEvent(eventType, message)
+
+        msg = ctypes.wintypes.MSG.from_address(message.__int__())
+        if msg.message != 0x84:
+            return False, 0
+
+        x = msg.lParam & 0xffff
+        y = (msg.lParam >> 16) & 0xffff
+        pos = self.mapFromGlobal(QtCore.QPoint(x, y))
+        border = 8
+        if pos.x() < border and pos.y() < border: return True, 13
+        elif pos.x() > self.width() - border and pos.y() < border: return True, 14
+        elif pos.x() < border and pos.y() > self.height() - border: return True, 16
+        elif pos.x() > self.width() - border and pos.y() > self.height() - border: return True, 17
+        elif pos.x() < border: return True, 10
+        elif pos.x() > self.width() - border: return True, 11
+        elif pos.y() < border: return True, 12
+        elif pos.y() > self.height() - border: return True, 15
+        return super().nativeEvent(eventType, message)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == QtCore.Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_pos)
+            event.accept()
+
+    def toggle_mode(self):
+        self.quick_mode = not self.quick_mode
+        text = "Switch to Quick Scan (" + ", ".join(QUICK_SECTIONS) + ")" if not self.quick_mode else "Switch to Deep Scan (All Drives except C:)"
+        self.toggle_btn.setText(text)
+        self.status.setText("⏳ Re-indexing in background...")
+        self.index_files()
+
+    def index_files(self):
+        if hasattr(self, 'indexer') and self.indexer.isRunning():
+            self.indexer.stop()
+            self.indexer.wait()
+        self.indexer = IndexerThread(self.quick_mode)
+        self.indexer.indexed.connect(self.update_index)
+        self.indexer.start()
+
+    def update_index(self, files):
+        self.all_files = files
+        self.save_cache()
+        self.status.setText(f"✅ Indexed {len(files):,} files. Start typing...")
+        self.search_files(self.input.text())
+
+    def search_files(self, text):
+        self.results.setRowCount(0)
+        text = text.strip().lower()
+        if not text or not self.all_files:
+            return
+        matches = [f for f in self.all_files if text in f["name"].lower()][:SEARCH_LIMIT]
+        self.results.setRowCount(len(matches))
+        for row, file in enumerate(matches):
+            self.results.setItem(row, 0, QtWidgets.QTableWidgetItem(file["name"]))
+            self.results.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{round(file['size'] / (1024 * 1024), 2)}"))
+            self.results.setItem(row, 2, QtWidgets.QTableWidgetItem(time.strftime('%Y-%m-%d %H:%M', time.localtime(file["mtime"]))))
+            self.results.setItem(row, 3, QtWidgets.QTableWidgetItem(file["path"]))
+
+    def get_selected_path(self, pos):
+        row = self.results.rowAt(pos.y())
+        return None if row < 0 else self.results.item(row, 3).text()
+
+    def open_file(self, index):
+        path = self.results.item(index.row(), 3).text()
+        if os.path.exists(path):
+            try:
+                os.startfile(path)
+            except:
+                subprocess.run(["explorer", "/select,", path])
+
+    def show_context_menu(self, pos):
+        path = self.get_selected_path(pos)
+        if not path or not os.path.exists(path): return
+        menu = QtWidgets.QMenu()
+        open_folder = menu.addAction("📂 Open Destination Folder")
+        copy_path = menu.addAction("📋 Copy File Path")
+        delete_file = menu.addAction("🗑️ Delete File")
+        action = menu.exec_(self.results.mapToGlobal(pos))
+        if action == open_folder:
+            subprocess.run(["explorer", "/select,", path])
+        elif action == copy_path:
+            QtWidgets.QApplication.clipboard().setText(path)
+        elif action == delete_file:
+            if QtWidgets.QMessageBox.question(self, "Confirm Delete", f"Delete this file?\n{path}") == QtWidgets.QMessageBox.Yes:
+                try:
+                    os.remove(path)
+                    self.search_files(self.input.text())
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "Error", str(e))
+
+    def save_cache(self):
+        try:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.all_files, f)
+        except: pass
+
+    def load_cache(self):
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    self.all_files = json.load(f)
+                    self.status.setText(f"📂 Loaded {len(self.all_files)} cached files. Refreshing index...")
+                    self.search_files("")
+            except: pass
+
+    def closeEvent(self, event):
+        self.settings.setValue("geometry", self.saveGeometry())
+        super().closeEvent(event)
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    window = SleekSearchApp()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
